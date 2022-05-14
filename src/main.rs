@@ -1,43 +1,41 @@
-use crate::discovery::ApiResource;
-use crate::watcher::{Error, Event};
+use std::time::Duration;
+
 use futures::{stream, StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::Node;
-use k8s_openapi::{api_version, serde_json};
-use kube::api::{DynamicObject, GroupVersionKind, ListParams};
-use kube::core::discovery;
-use kube::discovery::{verbs, Scope};
-use kube::runtime::utils::try_flatten_applied;
-use kube::runtime::{reflector, watcher};
+use k8s_openapi::serde_json;
 use kube::{Api, Client, Discovery, ResourceExt};
-use rdkafka::message::OwnedHeaders;
-use rdkafka::producer::future_producer::OwnedDeliveryResult;
-use rdkafka::producer::{BaseRecord, FutureProducer, FutureRecord, Producer};
-use rdkafka::util::Timeout;
+use kube::api::{DynamicObject, ListParams};
+use kube::core::discovery;
+use kube::discovery::verbs;
+use kube::runtime::watcher;
 use rdkafka::ClientConfig;
-use std::future::Future;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use rdkafka::message::OwnedHeaders;
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::util::Timeout;
 use tokio::main;
+
+use crate::discovery::ApiResource;
+use crate::watcher::Event;
 
 #[main]
 async fn main() -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     let discovery = Discovery::new(client.clone()).run().await?;
-    let mut watchers = vec![];
 
     // TODO: a watcher for any new Kinds that get added in after this starts
+    let mut watchers = vec![];
     for api_group in discovery.groups() {
         for (api_resource, capabilities) in api_group.recommended_resources() {
             if capabilities.supports_operation(verbs::WATCH)
                 && capabilities.supports_operation(verbs::LIST)
             {
                 println!(
-                    "Setting up watch for: {:?}-{:?}",
+                    "Watching: {:?}-{:?}",
                     api_group.name(),
                     api_resource
                 );
             } else {
                 println!(
-                    "cannot watch/list {:?}-{:?}",
+                    "Cannot watch/list {:?}-{:?}",
                     api_group.name(),
                     api_resource
                 );
@@ -45,39 +43,39 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let api: Api<DynamicObject> = Api::all_with(client.clone(), &api_resource);
-            let watcher = watcher(api, ListParams::default());
 
-            let x = watcher
+            // Kube events don't always contain the full identifying group-version-kind, so we zip
+            // the events with them to ensure the reader always knows what resources it's handling
+            watchers.push(watcher(api, ListParams::default())
                 .zip(stream::repeat(api_resource))
-                .map(|(w, ar)| w.map(|inner| (inner, ar)));
-            watchers.push(x.boxed());
+                .map(|(w, ar)| w.map(|inner| (inner, ar))).boxed());
         }
     }
 
+    // TODO: command line args for Kafka connection
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", "127.0.0.1:61053")
         .create()
         .expect("kafka producer creation error");
 
     let mut all_resources = stream::select_all(watchers);
-    // TODO: we'd want monotonic time here
-    let mut timestamp_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
 
-    while let kube_resource = all_resources.try_next().await {
-        let inner_produce = producer.clone();
+    loop {
+        let kube_resource = all_resources.try_next().await;
+
+        let kafka_producer = producer.clone();
         match kube_resource {
             Ok(Some((Event::Applied(result), resource))) => {
                 if let Ok(json) = serde_json::to_string(&result) {
                     println!("Applied: {} - {:?}", json, resource);
                     let key = get_kafka_key(&result, &resource);
+                    // do not take this async code for inspiration. don't know what I'm doing
                     tokio::spawn(async move {
-                        let future = inner_produce.send(
+                        let future = kafka_producer.send(
+                            // TODO: command line args for Kafka topic
                             FutureRecord::to("kubecdc")
                                 .key(&key)
-                                .headers(get_kafka_headers(timestamp_epoch, &resource))
+                                .headers(get_kafka_headers(&resource))
                                 .payload(&json),
                             Timeout::Never,
                         );
@@ -99,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
                 tokio::spawn(async move {
                     let record: FutureRecord<String, String> =
                         FutureRecord::to("kubecdc").key(&key);
-                    let future = inner_produce.send(record, Timeout::Never);
+                    let future = kafka_producer.send(record, Timeout::Never);
                     match future.await {
                         Ok(delivery) => println!("Sent deletion: {:?}", delivery),
                         Err((e, _)) => println!("Error deleting: {:?}", e),
@@ -107,26 +105,18 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
             Ok(Some((Event::Restarted(replacements), resource))) => {
-                // Requires atomically repopulating the downstream
-                // can use a timestamp as a best effort, and let the
-                // materialized views filter on the greatest timestamp
-                // TODO: Restarted gets called on initial population so it's not just for errors later...
-                timestamp_epoch = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis();
                 println!("Restarted {:?}", resource);
-
+                // use a Kafka transaction to atomically write in the whole updated batch of records
                 tokio::spawn(async move {
                     // TODO: error handling the transaction BEGIN/COMMIT points
-                    inner_produce.begin_transaction();
+                    kafka_producer.begin_transaction();
                     for result in replacements {
                         let key = get_kafka_key(&result, &resource);
                         if let Ok(json) = serde_json::to_string(&result) {
-                            let future = inner_produce.send(
+                            let future = kafka_producer.send(
                                 FutureRecord::to("kubecdc")
                                     .key(&key)
-                                    .headers(get_kafka_headers(timestamp_epoch, &resource))
+                                    .headers(get_kafka_headers(&resource))
                                     .payload(&json),
                                 Timeout::Never,
                             );
@@ -136,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    inner_produce.commit_transaction(Duration::from_secs(30));
+                    kafka_producer.commit_transaction(Duration::from_secs(30));
                 });
             }
             Err(err) => {
@@ -147,8 +137,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-
-    Ok(())
 }
 
 fn get_kafka_key(object: &DynamicObject, resource: &ApiResource) -> String {
@@ -162,11 +150,12 @@ fn get_kafka_key(object: &DynamicObject, resource: &ApiResource) -> String {
     )
 }
 
-fn get_kafka_headers(timestamp_epoch: u128, resource: &ApiResource) -> OwnedHeaders {
+// really lazy way to pass in group-version-kind information without modifying the Kube payload.
+// this should prolly be in some outer envelope, rather than passed separately as headers
+fn get_kafka_headers(resource: &ApiResource) -> OwnedHeaders {
     OwnedHeaders::new()
         .add("kube_kind", &resource.kind)
         .add("kube_group", &resource.group)
         .add("kube_version", &resource.version)
         .add("kube_plural", &resource.plural)
-        .add("timestamp_epoch", &timestamp_epoch.to_string())
 }
