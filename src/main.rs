@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use clap::Parser;
 use futures::{stream, StreamExt, TryStreamExt};
 use k8s_openapi::serde_json;
 use kube::{Api, Client, Discovery, ResourceExt};
@@ -16,8 +17,25 @@ use tokio::main;
 use crate::discovery::ApiResource;
 use crate::watcher::Event;
 
+#[derive(Debug, clap::Parser)]
+pub struct Args {
+    /// The Kafka host
+    #[clap(long, default_value = "localhost")]
+    pub kafka_host: String,
+
+    /// The Kafka port
+    #[clap(long, default_value = "9092")]
+    pub kafka_port: u16,
+
+    /// The Kafka topic to publish Kube events into
+    #[clap(long, default_value = "kubestream")]
+    pub kafka_topic: String,
+}
+
 #[main]
-async fn main() -> anyhow::Result<()> {
+pub async fn main() -> anyhow::Result<()> {
+    let config: Args = Args::parse();
+
     let client = Client::try_default().await?;
     let discovery = Discovery::new(client.clone()).run().await?;
 
@@ -52,9 +70,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // TODO: command line args for Kafka connection
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", "127.0.0.1:61053")
+        .set("bootstrap.servers", format!("{}:{}", config.kafka_host, config.kafka_port))
         .create()
         .expect("kafka producer creation error");
 
@@ -63,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let kube_resource = all_resources.try_next().await;
 
+        let topic = config.kafka_topic.clone();
         let kafka_producer = producer.clone();
         match kube_resource {
             Ok(Some((Event::Applied(result), resource))) => {
@@ -72,8 +90,7 @@ async fn main() -> anyhow::Result<()> {
                     // do not take this async code for inspiration. don't know what I'm doing
                     tokio::spawn(async move {
                         let future = kafka_producer.send(
-                            // TODO: command line args for Kafka topic
-                            FutureRecord::to("kubecdc")
+                            FutureRecord::to(&topic)
                                 .key(&key)
                                 .headers(get_kafka_headers(&resource))
                                 .payload(&json),
@@ -96,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Deleted: {}", key);
                 tokio::spawn(async move {
                     let record: FutureRecord<String, String> =
-                        FutureRecord::to("kubecdc").key(&key);
+                        FutureRecord::to(&topic).key(&key);
                     let future = kafka_producer.send(record, Timeout::Never);
                     match future.await {
                         Ok(delivery) => println!("Sent deletion: {:?}", delivery),
@@ -114,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
                         let key = get_kafka_key(&result, &resource);
                         if let Ok(json) = serde_json::to_string(&result) {
                             let future = kafka_producer.send(
-                                FutureRecord::to("kubecdc")
+                                FutureRecord::to(&topic)
                                     .key(&key)
                                     .headers(get_kafka_headers(&resource))
                                     .payload(&json),
