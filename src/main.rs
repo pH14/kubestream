@@ -1,24 +1,24 @@
-use anyhow::{anyhow, bail, Context, Error};
+use anyhow::{anyhow, bail, Context};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use clap::Parser;
-use futures::future::{join_all, try_join_all};
+use futures::future::try_join_all;
 use futures::stream::BoxStream;
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
-use k8s_openapi::{api_version, serde_json};
+use futures::{FutureExt, StreamExt, TryStreamExt};
+use k8s_openapi::serde_json;
 use kube::api::{DynamicObject, ListParams};
 use kube::core::discovery;
 use kube::discovery::verbs;
 use kube::runtime::watcher;
 use kube::{Api, Client, Discovery, ResourceExt};
-use rdkafka::error::{KafkaError, KafkaResult};
-use rdkafka::message::{OwnedHeaders, OwnedMessage};
-use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+
+use rdkafka::message::OwnedHeaders;
+use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use rdkafka::ClientConfig;
-use tokio::task::JoinError;
+
 use tokio::{main, select};
 use tracing::{error, info, trace, Level};
 
@@ -63,6 +63,9 @@ pub async fn main() -> anyhow::Result<()> {
             "bootstrap.servers",
             format!("{}:{}", config.kafka_host, config.kafka_port),
         )
+        .set("linger.ms", "100")
+        .set("message.timeout.ms", "5000")
+        .set("delivery.timeout.ms", "15000")
         .create()
         .expect("kafka producer creation error");
 
@@ -109,7 +112,7 @@ pub async fn main() -> anyhow::Result<()> {
                     .map(move |a| a.map(|e| e.context(error_message)))
                     .fuse();
 
-                    watchers_map.insert(api_resource.clone(), join_handle);
+                    watchers_map.insert(api_resource, join_handle);
                 }
             }
 
@@ -130,20 +133,6 @@ pub async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            //
-            // let results = try_join_all(watchers_map.values_mut()).await;
-            //     match results {
-            //         Ok(results) => {
-            //             for result in results {
-            //                 if let Err(e) = result {
-            //                     eprintln!("Watcher error: {}", e);
-            //                 }
-            //             }
-            //         },
-            //         Err(e) => {
-            //             return Err(anyhow!(e));
-            //         }
-            //     }
 
             select! {
                  results = try_join_all(watchers_map.values_mut()) => {
@@ -167,6 +156,7 @@ pub async fn main() -> anyhow::Result<()> {
             }
         }
 
+        #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
 
@@ -181,27 +171,25 @@ async fn watcher_to_kafka(
     resource: ApiResource,
     mut stream: BoxStream<'_, watcher::Result<Event<DynamicObject>>>,
 ) -> Result<(), anyhow::Error> {
-    let resource = Arc::new(resource);
+    let kafka_topic = &config.kafka_topic;
     info!("Starting watcher to {:?}", resource);
-
-    let (kafka_producer, resource, kafka_topic) = (
-        kafka_producer.clone(),
-        Arc::clone(&resource),
-        config.kafka_topic.clone(),
-    );
 
     loop {
         trace!("Awaiting next on {:?}", resource);
         let kube_event = stream.try_next().await;
 
         match kube_event {
-            Ok(Some(Event::Applied(result))) => {
-                let json = serde_json::to_string(&result)
-                    .expect(&format!("unable to deserialize Kube event: {:?}", result));
-                let key = get_kafka_key(&result, &resource);
-                trace!("Sending {:?} of type {:?}", result, resource);
+            Ok(Some(Event::Applied(event))) => {
+                let json = serde_json::to_string(&event).unwrap_or_else(|e| {
+                    panic!(
+                        "unable to deserialize Kube event: {} for event {:?}",
+                        e, event
+                    )
+                });
+                let key = get_kafka_key(&event, &resource);
+                trace!("Sending {:?} of type {:?}", event, resource);
                 let future = kafka_producer.send(
-                    FutureRecord::to(&kafka_topic)
+                    FutureRecord::to(kafka_topic)
                         .key(&key)
                         .headers(get_kafka_headers(&resource))
                         .payload(&json),
@@ -212,9 +200,9 @@ async fn watcher_to_kafka(
                     Err((e, _)) => return Err(e.into()),
                 }
             }
-            Ok(Some(Event::Deleted(result))) => {
-                let key = get_kafka_key(&result, &resource);
-                let record: FutureRecord<String, String> = FutureRecord::to(&kafka_topic).key(&key);
+            Ok(Some(Event::Deleted(event))) => {
+                let key = get_kafka_key(&event, &resource);
+                let record: FutureRecord<String, String> = FutureRecord::to(kafka_topic).key(&key);
 
                 let future = kafka_producer.send(record, Timeout::After(Duration::from_secs(10)));
                 match future.await {
@@ -229,12 +217,16 @@ async fn watcher_to_kafka(
                     events.len()
                 );
 
-                let mut events: Vec<_> = events
+                let events: Vec<_> = events
                     .iter()
                     .map(|event| {
                         let key = get_kafka_key(&event, &resource);
-                        let json = serde_json::to_string(&event)
-                            .expect(&format!("unable to deserialize Kube event: {:?}", event));
+                        let json = serde_json::to_string(&event).unwrap_or_else(|e| {
+                            panic!(
+                                "unable to deserialize Kube event: {} for event {:?}",
+                                e, event
+                            )
+                        });
                         (key, json)
                     })
                     .collect();
@@ -243,7 +235,7 @@ async fn watcher_to_kafka(
                 for (key, json) in &events {
                     futures.push(
                         kafka_producer.send(
-                            FutureRecord::to(&kafka_topic)
+                            FutureRecord::to(kafka_topic)
                                 .key(key)
                                 .headers(get_kafka_headers(&resource))
                                 .payload(json),
@@ -275,7 +267,7 @@ fn get_kafka_key(object: &DynamicObject, resource: &ApiResource) -> String {
         resource.api_version,
         resource.kind,
         resource.plural,
-        object.namespace().unwrap_or("".to_string()),
+        object.namespace().unwrap_or_else(|| "".to_string()),
         object.name()
     )
 }
