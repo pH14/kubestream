@@ -1,14 +1,15 @@
 [package]
-name = "kube-cdc"
+name = "kubestream"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-kube = { version = "0.71.0", features = ["runtime"] }
-k8s-openapi = { version = "0.14.0", features = ["v1_23"] }
-anyhow = "1.0.57"
-tokio = { version = "1.18.2", features = ["full"] }
+anyhow = { version = "1.0.57", features = ["default", "std", "backtrace"] }
+clap = { version = "3.1.18", features = ["derive"] }
 futures = "0.3.21"
+k8s-openapi = { version = "0.14.0", features = ["v1_23"] }
+kube = { version = "0.71.0", features = ["runtime"] }
 rdkafka = { version = "0.25", features = ["cmake-build"] }
+tokio = { version = "1.18.2", features = ["full"] }
+tracing = "0.1.34"
+tracing-subscriber = "0.3.11"
